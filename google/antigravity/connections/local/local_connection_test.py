@@ -22,44 +22,19 @@ import unittest
 from unittest import mock
 
 from absl.testing import absltest
-from google.protobuf import json_format
+
 import websockets
 
 from google.antigravity import types
 from google.antigravity.connections.local import local_connection
 from google.antigravity.connections.local import local_connection_config
 from google.antigravity.connections.local import localharness_pb2
+from google.antigravity.connections.local import test_utils
+
 from google.antigravity.hooks import hook_runner
 from google.antigravity.hooks import hooks as hooks_base
 from google.antigravity.tools import tool_runner
 from google.antigravity.types import QuestionResponse
-
-
-class FakeWebSocket:
-
-  def __init__(self):
-    self.queue = asyncio.Queue()
-    self.sent_messages = []
-
-  async def send(self, message):
-    self.sent_messages.append(message)
-
-  async def put_event(self, event):
-    await self.queue.put(json_format.MessageToJson(event))
-
-  def __aiter__(self):
-
-    async def _gen():
-      while True:
-        msg = await self.queue.get()
-        if msg is None:  # Sentinel for close
-          break
-        yield msg
-
-    return _gen()
-
-  async def close(self):
-    await self.queue.put(None)
 
 
 class LocalConnectionTest(unittest.IsolatedAsyncioTestCase):
@@ -67,16 +42,18 @@ class LocalConnectionTest(unittest.IsolatedAsyncioTestCase):
   def setUp(self):
     super().setUp()
     self.mock_process = mock.MagicMock(spec=subprocess.Popen)
-    self.mock_ws = FakeWebSocket()
     self.tool_runner = tool_runner.ToolRunner()
 
-  async def test_receive_steps_basic(self):
-    conn = local_connection.LocalConnection(
+  def _make_harness(self, hook_runner=None):
+    return test_utils.TestLocalHarness(
+        test_case=self,
         process=self.mock_process,
-        ws=self.mock_ws,
         tool_runner=self.tool_runner,
+        hook_runner=hook_runner,
     )
 
+  async def test_receive_steps_basic(self):
+    harness = self._make_harness()
     event = localharness_pb2.OutputEvent(
         step_update=localharness_pb2.StepUpdate(
             step_index=1,
@@ -86,14 +63,14 @@ class LocalConnectionTest(unittest.IsolatedAsyncioTestCase):
         )
     )
 
-    await self.mock_ws.put_event(event)
-    await self.mock_ws.close()
+    await harness.send_event(event)
+    await harness.close_from_harness_side()
 
     # Simulate that a turn is active (send clears this in reality)
-    conn._is_idle.clear()
+    harness.conn._is_idle.clear()
 
     steps = []
-    async for step in conn.receive_steps():
+    async for step in harness.conn.receive_steps():
       steps.append(step)
 
     self.assertEqual(len(steps), 1)
@@ -144,12 +121,7 @@ class LocalConnectionTest(unittest.IsolatedAsyncioTestCase):
 
   async def test_receive_steps_thinking_populated(self):
     """Tests that thinking field flows from proto through to SDK Step."""
-    conn = local_connection.LocalConnection(
-        process=self.mock_process,
-        ws=self.mock_ws,
-        tool_runner=self.tool_runner,
-    )
-
+    harness = self._make_harness()
     event = localharness_pb2.OutputEvent(
         step_update=localharness_pb2.StepUpdate(
             step_index=1,
@@ -160,12 +132,12 @@ class LocalConnectionTest(unittest.IsolatedAsyncioTestCase):
         )
     )
 
-    await self.mock_ws.put_event(event)
-    await self.mock_ws.close()
-    conn._is_idle.clear()
+    await harness.send_event(event)
+    await harness.close_from_harness_side()
+    harness.conn._is_idle.clear()
 
     steps = []
-    async for step in conn.receive_steps():
+    async for step in harness.conn.receive_steps():
       steps.append(step)
 
     self.assertEqual(len(steps), 1)
@@ -179,12 +151,7 @@ class LocalConnectionTest(unittest.IsolatedAsyncioTestCase):
     fields from the same model response. A regression to mutually exclusive
     branches would zero out one of the two.
     """
-    conn = local_connection.LocalConnection(
-        process=self.mock_process,
-        ws=self.mock_ws,
-        tool_runner=self.tool_runner,
-    )
-
+    harness = self._make_harness()
     event = localharness_pb2.OutputEvent(
         step_update=localharness_pb2.StepUpdate(
             step_index=1,
@@ -195,12 +162,12 @@ class LocalConnectionTest(unittest.IsolatedAsyncioTestCase):
         )
     )
 
-    await self.mock_ws.put_event(event)
-    await self.mock_ws.close()
-    conn._is_idle.clear()
+    await harness.send_event(event)
+    await harness.close_from_harness_side()
+    harness.conn._is_idle.clear()
 
     steps = []
-    async for step in conn.receive_steps():
+    async for step in harness.conn.receive_steps():
       steps.append(step)
 
     self.assertEqual(len(steps), 1)
@@ -276,17 +243,17 @@ class LocalConnectionTest(unittest.IsolatedAsyncioTestCase):
 
     hr.pre_turn_hooks.append(DenyingTurnHook())
 
-    conn = local_connection.LocalConnection(
+    harness = test_utils.TestLocalHarness(
+        test_case=self,
         process=self.mock_process,
-        ws=self.mock_ws,
         tool_runner=self.tool_runner,
         hook_runner=hr,
     )
 
-    await conn.send("Hello")
+    await harness.conn.send("Hello")
 
     steps = []
-    async for step in conn.receive_steps():
+    async for step in harness.conn.receive_steps():
       steps.append(step)
 
     self.assertEqual(len(steps), 1)
@@ -303,9 +270,9 @@ class LocalConnectionTest(unittest.IsolatedAsyncioTestCase):
 
     hr.pre_tool_call_decide_hooks.append(DenyingToolHook())
 
-    local_connection.LocalConnection(
+    harness = test_utils.TestLocalHarness(
+        test_case=self,
         process=self.mock_process,
-        ws=self.mock_ws,
         tool_runner=self.tool_runner,
         hook_runner=hr,
     )
@@ -318,14 +285,10 @@ class LocalConnectionTest(unittest.IsolatedAsyncioTestCase):
         )
     )
 
-    await self.mock_ws.put_event(event)
-
-    # Allow reader loop to process
-    await asyncio.sleep(0.1)
+    await harness.send_event(event)
 
     # Verify that ToolResponse was sent back to harness denying it
-    self.assertEqual(len(self.mock_ws.sent_messages), 1)
-    sent_data = json.loads(self.mock_ws.sent_messages[0])
+    sent_data = await harness.wait_for_response()
     self.assertIn("toolResponse", sent_data)
     resp = sent_data["toolResponse"]
     self.assertEqual(resp["id"], "call_1")
@@ -341,9 +304,9 @@ class LocalConnectionTest(unittest.IsolatedAsyncioTestCase):
 
     hr.pre_tool_call_decide_hooks.append(DenyingToolHook())
 
-    local_connection.LocalConnection(
+    harness = test_utils.TestLocalHarness(
+        test_case=self,
         process=self.mock_process,
-        ws=self.mock_ws,
         tool_runner=self.tool_runner,
         hook_runner=hr,
     )
@@ -358,12 +321,9 @@ class LocalConnectionTest(unittest.IsolatedAsyncioTestCase):
         )
     )
 
-    await self.mock_ws.put_event(event)
+    await harness.send_event(event)
 
-    await asyncio.sleep(0.1)
-
-    self.assertEqual(len(self.mock_ws.sent_messages), 1)
-    sent_data = json.loads(self.mock_ws.sent_messages[0])
+    sent_data = await harness.wait_for_response()
     self.assertIn("toolConfirmation", sent_data)
     self.assertEqual(sent_data["toolConfirmation"]["trajectoryId"], "test_traj")
     self.assertFalse(sent_data["toolConfirmation"]["accepted"])
@@ -375,20 +335,22 @@ class LocalConnectionTest(unittest.IsolatedAsyncioTestCase):
     than raw proto field names. For view_file these happen to match, but the
     test locks in the contract.
     """
+    hook_event = asyncio.Event()
     captured_tool_names = []
 
     class CapturingToolHook:
 
       async def run(self, context, data):  # pylint: disable=unused-argument
         captured_tool_names.append(data.name)
+        hook_event.set()
         return hooks_base.HookResult(allow=True)
 
     hr = hook_runner.HookRunner()
     hr.pre_tool_call_decide_hooks.append(CapturingToolHook())
 
-    local_connection.LocalConnection(
+    harness = test_utils.TestLocalHarness(
+        test_case=self,
         process=self.mock_process,
-        ws=self.mock_ws,
         tool_runner=self.tool_runner,
         hook_runner=hr,
     )
@@ -402,8 +364,8 @@ class LocalConnectionTest(unittest.IsolatedAsyncioTestCase):
             view_file=localharness_pb2.ActionViewFile(file_path="/foo/bar"),
         )
     )
-    await self.mock_ws.put_event(event)
-    await asyncio.sleep(0.1)
+    await harness.send_event(event)
+    await harness.wait_for_event(hook_event)
 
     self.assertEqual(captured_tool_names, [types.BuiltinTools.VIEW_FILE.value])
 
@@ -413,20 +375,22 @@ class LocalConnectionTest(unittest.IsolatedAsyncioTestCase):
     Why: find_file is a harness builtin tool that must be correctly identified
     in _BUILTIN_TOOL_PROTO_FIELDS so hooks receive the right name.
     """
+    hook_event = asyncio.Event()
     captured_tool_names = []
 
     class CapturingToolHook:
 
       async def run(self, context, data):  # pylint: disable=unused-argument
         captured_tool_names.append(data.name)
+        hook_event.set()
         return hooks_base.HookResult(allow=True)
 
     hr = hook_runner.HookRunner()
     hr.pre_tool_call_decide_hooks.append(CapturingToolHook())
 
-    local_connection.LocalConnection(
+    harness = test_utils.TestLocalHarness(
+        test_case=self,
         process=self.mock_process,
-        ws=self.mock_ws,
         tool_runner=self.tool_runner,
         hook_runner=hr,
     )
@@ -443,8 +407,8 @@ class LocalConnectionTest(unittest.IsolatedAsyncioTestCase):
             ),
         )
     )
-    await self.mock_ws.put_event(event)
-    await asyncio.sleep(0.1)
+    await harness.send_event(event)
+    await harness.wait_for_event(hook_event)
 
     self.assertEqual(captured_tool_names, [types.BuiltinTools.FIND_FILE.value])
 
@@ -462,9 +426,9 @@ class LocalConnectionTest(unittest.IsolatedAsyncioTestCase):
 
     hr.on_interaction_hooks.append(AutoAnswerQuestionHook())
 
-    local_connection.LocalConnection(
+    harness = test_utils.TestLocalHarness(
+        test_case=self,
         process=self.mock_process,
-        ws=self.mock_ws,
         tool_runner=self.tool_runner,
         hook_runner=hr,
     )
@@ -487,18 +451,16 @@ class LocalConnectionTest(unittest.IsolatedAsyncioTestCase):
         )
     )
 
-    await self.mock_ws.put_event(event)
+    await harness.send_event(event)
 
-    await asyncio.sleep(0.1)
-
-    self.assertEqual(len(self.mock_ws.sent_messages), 1)
-    sent_data = json.loads(self.mock_ws.sent_messages[0])
+    sent_data = await harness.wait_for_response()
     self.assertIn("questionResponse", sent_data)
     self.assertEqual(sent_data["questionResponse"]["trajectoryId"], "test_traj")
 
   async def test_deduplication_of_wait_requests(self):
     """Verifies that multiple updates for the same wait state don't duplicate."""
     hr = hook_runner.HookRunner()
+    hook_event = asyncio.Event()
 
     class CountingHook:
 
@@ -508,14 +470,15 @@ class LocalConnectionTest(unittest.IsolatedAsyncioTestCase):
       async def run(self, context, data):  # pylint: disable=unused-argument
         del context, data
         self.call_count += 1
+        hook_event.set()
         return hooks_base.HookResult(allow=True)
 
     hook_instance = CountingHook()
     hr.pre_tool_call_decide_hooks.append(hook_instance)
 
-    local_connection.LocalConnection(
+    harness = test_utils.TestLocalHarness(
+        test_case=self,
         process=self.mock_process,
-        ws=self.mock_ws,
         tool_runner=self.tool_runner,
         hook_runner=hr,
     )
@@ -531,19 +494,22 @@ class LocalConnectionTest(unittest.IsolatedAsyncioTestCase):
     )
 
     # Send the exact same wait event three times (e.g. keepalives)
-    await self.mock_ws.put_event(event)
-    await self.mock_ws.put_event(event)
-    await self.mock_ws.put_event(event)
+    await harness.send_event(event)
+    await harness.send_event(event)
+    await harness.send_event(event)
 
-    await asyncio.sleep(0.2)  # Give reader loop and async tasks time to process
+    # Wait for the response to ensure at least one event was processed
+    await harness.wait_for_response()
 
     # Hook should only be called ONCE despite 3 events, thanks to _handled_waits
     self.assertEqual(hook_instance.call_count, 1)
-    self.assertEqual(len(self.mock_ws.sent_messages), 1)
+    self.assertEqual(len(harness.ws.sent_messages), 1)
 
   async def test_async_non_blocking_dispatch(self):
     """Verifies that wait handlers run concurrently without blocking loop."""
     hr = hook_runner.HookRunner()
+    started_event = asyncio.Event()
+    finish_event = asyncio.Event()
 
     class BlockingHook:
 
@@ -554,16 +520,17 @@ class LocalConnectionTest(unittest.IsolatedAsyncioTestCase):
       async def run(self, context, data):  # pylint: disable=unused-argument
         del context, data
         self.started = True
-        await asyncio.sleep(0.5)  # Simulate a slow human interaction
+        started_event.set()
+        await finish_event.wait()
         self.finished = True
         return hooks_base.HookResult(allow=True)
 
     hook_instance = BlockingHook()
     hr.pre_tool_call_decide_hooks.append(hook_instance)
 
-    conn = local_connection.LocalConnection(
+    harness = test_utils.TestLocalHarness(
+        test_case=self,
         process=self.mock_process,
-        ws=self.mock_ws,
         tool_runner=self.tool_runner,
         hook_runner=hr,
     )
@@ -588,31 +555,32 @@ class LocalConnectionTest(unittest.IsolatedAsyncioTestCase):
         )
     )
 
-    await self.mock_ws.put_event(wait_event)
-    await self.mock_ws.put_event(active_event)
+    await harness.send_event(wait_event)
+    await harness.send_event(active_event)
 
-    # Wait just a tiny bit to let the reader loop process both events
-    await asyncio.sleep(0.1)
+    # Wait for the hook to start
+    await harness.wait_for_event(started_event)
 
-    # The hook should have started, but not finished (because of the 0.5s sleep)
+    # The hook should have started, but not finished
     self.assertTrue(hook_instance.started)
     self.assertFalse(hook_instance.finished)
 
     # The reader loop SHOULD NOT be blocked! It should have processed traj_2
     # and put both events into the step queue.
-    step1 = await conn._step_queue.get()
-    step2 = await conn._step_queue.get()
+    step1 = await harness.conn._step_queue.get()
+    step2 = await harness.conn._step_queue.get()
 
     self.assertEqual(step1.trajectory_id, "traj_1")
     self.assertEqual(step2.trajectory_id, "traj_2")
     self.assertEqual(step2.content, "I am another agent running concurrently")
 
-    # Cleanup: Wait for hook to finish so we don't get pending task errors
-    await asyncio.sleep(0.5)
+    # Cleanup: Allow hook to finish
+    finish_event.set()
 
   async def test_state_transition_clears_handled_requests(self):
     """Verifies WAITING -> ACTIVE -> WAITING transitions re-trigger handlers."""
     hr = hook_runner.HookRunner()
+    hook_event = asyncio.Event()
 
     class CountingHook:
 
@@ -622,14 +590,15 @@ class LocalConnectionTest(unittest.IsolatedAsyncioTestCase):
       async def run(self, context, data):  # pylint: disable=unused-argument
         del context, data
         self.call_count += 1
+        hook_event.set()
         return hooks_base.HookResult(allow=True)
 
     hook_instance = CountingHook()
     hr.pre_tool_call_decide_hooks.append(hook_instance)
 
-    local_connection.LocalConnection(
+    harness = test_utils.TestLocalHarness(
+        test_case=self,
         process=self.mock_process,
-        ws=self.mock_ws,
         tool_runner=self.tool_runner,
         hook_runner=hr,
     )
@@ -654,27 +623,29 @@ class LocalConnectionTest(unittest.IsolatedAsyncioTestCase):
     )
 
     # 1. First wait
-    await self.mock_ws.put_event(create_wait_event())
-    await asyncio.sleep(0.1)
+    await harness.send_event(create_wait_event())
+    await harness.wait_for_event(hook_event)
     self.assertEqual(hook_instance.call_count, 1)
 
-    # 2. Transition back to active (this should clear the handled_requests)
-    await self.mock_ws.put_event(active_event)
-    await asyncio.sleep(0.1)
+    # Reset event for next wait
+    hook_event.clear()
+
+    # 2. Transition back to active
+    await harness.send_event(active_event)
 
     # 3. Second wait on the SAME step
-    await self.mock_ws.put_event(create_wait_event())
-    await asyncio.sleep(0.1)
+    await harness.send_event(create_wait_event())
+    await harness.wait_for_event(hook_event)
 
     # The hook should be called a second time!
     self.assertEqual(hook_instance.call_count, 2)
-    self.assertEqual(len(self.mock_ws.sent_messages), 2)
+    self.assertEqual(len(harness.ws.sent_messages), 2)
 
   async def test_yielding_wait_state_to_queue(self):
     """Verifies that wait states are correctly yielded to the step queue for the UI to render."""
-    conn = local_connection.LocalConnection(
+    harness = test_utils.TestLocalHarness(
+        test_case=self,
         process=self.mock_process,
-        ws=self.mock_ws,
         tool_runner=self.tool_runner,
     )
 
@@ -687,11 +658,12 @@ class LocalConnectionTest(unittest.IsolatedAsyncioTestCase):
         )
     )
 
-    await self.mock_ws.put_event(event)
-    await asyncio.sleep(0.1)
+    await harness.send_event(event)
 
     # We should be able to retrieve this step from the queue
-    step_obj = await conn._step_queue.get()
+    step_obj = await asyncio.wait_for(
+        harness.conn._step_queue.get(), timeout=2.0
+    )
     self.assertEqual(step_obj.trajectory_id, "ui_traj")
     self.assertEqual(step_obj.id, "ui_traj-5")
     self.assertEqual(step_obj.status, types.StepStatus.WAITING_FOR_USER)
@@ -699,25 +671,21 @@ class LocalConnectionTest(unittest.IsolatedAsyncioTestCase):
 
   async def test_cancel(self):
     """Verifies that cancel sends a halt request."""
-    conn = local_connection.LocalConnection(
+    harness = test_utils.TestLocalHarness(
+        test_case=self,
         process=self.mock_process,
-        ws=self.mock_ws,
         tool_runner=self.tool_runner,
     )
 
-    await conn.cancel()
+    await harness.conn.cancel()
 
-    self.assertEqual(len(self.mock_ws.sent_messages), 1)
-    sent_data = json.loads(self.mock_ws.sent_messages[0])
+    sent_data = await harness.wait_for_response()
     self.assertTrue(sent_data.get("haltRequest"))
 
   async def test_handle_tool_call_queues_step(self):
     """Tests ensuring _handle_tool_call manually queues the ToolCall step in _step_queue."""
-    conn = local_connection.LocalConnection(
-        process=self.mock_process,
-        ws=self.mock_ws,
-        tool_runner=self.tool_runner,
-    )
+    harness = self._make_harness()
+    conn = harness.conn
 
     # Mock tool_call protobuf message from WebSocket
     raw_tool_call = localharness_pb2.ToolCall(
@@ -900,7 +868,6 @@ class LocalConnectionToolCallNoRunnerTest(unittest.IsolatedAsyncioTestCase):
   def setUp(self):
     super().setUp()
     self.mock_process = mock.MagicMock()
-    self.mock_ws = FakeWebSocket()
 
   async def test_tool_call_without_runner_yields_step(self):
     """Verifies that a tool call with no ToolRunner queues a step for the user.
@@ -909,9 +876,9 @@ class LocalConnectionToolCallNoRunnerTest(unittest.IsolatedAsyncioTestCase):
     tool call to the caller so they can handle it manually, rather than
     silently dropping it.
     """
-    conn = local_connection.LocalConnection(
+    harness = test_utils.TestLocalHarness(
+        test_case=self,
         process=self.mock_process,
-        ws=self.mock_ws,
         tool_runner=None,
     )
 
@@ -923,16 +890,17 @@ class LocalConnectionToolCallNoRunnerTest(unittest.IsolatedAsyncioTestCase):
         )
     )
 
-    await self.mock_ws.put_event(event)
-    await asyncio.sleep(0.1)
+    await harness.send_event(event)
 
-    step_obj = await conn._step_queue.get()
+    step_obj = await asyncio.wait_for(
+        harness.conn._step_queue.get(), timeout=1.0
+    )
     self.assertEqual(step_obj.type, types.StepType.TOOL_CALL)
     self.assertEqual(step_obj.tool_calls[0].name, "custom_tool")
     self.assertEqual(step_obj.tool_calls[0].args, {"key": "value"})
     self.assertEqual(step_obj.tool_calls[0].id, "call_99")
     # No messages should have been sent back to the harness.
-    self.assertEqual(len(self.mock_ws.sent_messages), 0)
+    self.assertEqual(len(harness.ws.sent_messages), 0)
 
 
 class LocalConnectionStrategyConfigTest(unittest.TestCase):
@@ -1492,9 +1460,7 @@ class LocalConnectionStrategyApiKeyTest(unittest.IsolatedAsyncioTestCase):
 
   @mock.patch.dict("os.environ", {"GEMINI_API_KEY": "env-key"}, clear=True)
   @mock.patch("subprocess.Popen")
-  async def test_accepts_env_var_api_key(
-      self, mock_popen
-  ):
+  async def test_accepts_env_var_api_key(self, mock_popen):
     """Verifies entry does not raise when GEMINI_API_KEY env var is set.
 
     Why: The env var fallback is the most common path for 3P developers.
@@ -1520,9 +1486,7 @@ class LocalConnectionStrategyApiKeyTest(unittest.IsolatedAsyncioTestCase):
 
   @mock.patch.dict("os.environ", {}, clear=True)
   @mock.patch("subprocess.Popen")
-  async def test_accepts_gemini_config_api_key(
-      self, mock_popen
-  ):
+  async def test_accepts_gemini_config_api_key(self, mock_popen):
     """Verifies entry does not raise when GeminiConfig.api_key is set.
 
     Why: Explicit API key in config is the recommended path.
@@ -1599,51 +1563,55 @@ class LocalConnectionSessionHooksTest(unittest.IsolatedAsyncioTestCase):
   def setUp(self):
     super().setUp()
     self.mock_process = mock.MagicMock()
-    self.mock_ws = FakeWebSocket()
     self.tool_runner = tool_runner.ToolRunner()
 
   async def test_session_start_hook_dispatched_on_init(self):
     """Verifies OnSessionStartHook fires when LocalConnection is created."""
     called = []
+    event = asyncio.Event()
 
     class SessionStartHook:
 
       async def run(self, context, data):  # pylint: disable=unused-argument
         called.append("started")
+        event.set()
 
     hr = hook_runner.HookRunner()
     hr.on_session_start_hooks.append(SessionStartHook())
 
-    local_connection.LocalConnection(
+    harness = test_utils.TestLocalHarness(
+        test_case=self,
         process=self.mock_process,
-        ws=self.mock_ws,
         tool_runner=self.tool_runner,
         hook_runner=hr,
     )
 
-    await asyncio.sleep(0.1)
+    await asyncio.wait_for(event.wait(), timeout=1.0)
     self.assertEqual(called, ["started"])
 
   async def test_session_end_hook_dispatched_on_disconnect(self):
     """Verifies OnSessionEndHook fires when disconnect() is called."""
     called = []
+    event = asyncio.Event()
 
     class SessionEndHook:
 
       async def run(self, context, data):  # pylint: disable=unused-argument
         called.append("ended")
+        event.set()
 
     hr = hook_runner.HookRunner()
     hr.on_session_end_hooks.append(SessionEndHook())
 
-    conn = local_connection.LocalConnection(
+    harness = test_utils.TestLocalHarness(
+        test_case=self,
         process=self.mock_process,
-        ws=self.mock_ws,
         tool_runner=self.tool_runner,
         hook_runner=hr,
     )
 
-    await conn.disconnect()
+    await harness.conn.disconnect()
+    await asyncio.wait_for(event.wait(), timeout=1.0)
     self.assertEqual(called, ["ended"])
 
 
@@ -1653,7 +1621,6 @@ class LocalConnectionPostTurnHookTest(unittest.IsolatedAsyncioTestCase):
   def setUp(self):
     super().setUp()
     self.mock_process = mock.MagicMock()
-    self.mock_ws = FakeWebSocket()
     self.tool_runner = tool_runner.ToolRunner()
 
   async def test_post_turn_hook_dispatched_on_final_step(self):
@@ -1668,15 +1635,15 @@ class LocalConnectionPostTurnHookTest(unittest.IsolatedAsyncioTestCase):
     hr = hook_runner.HookRunner()
     hr.post_turn_hooks.append(PostTurnHook())
 
-    conn = local_connection.LocalConnection(
+    harness = test_utils.TestLocalHarness(
+        test_case=self,
         process=self.mock_process,
-        ws=self.mock_ws,
         tool_runner=self.tool_runner,
         hook_runner=hr,
     )
 
     # Simulate a send to create turn context.
-    await conn.send("hello")
+    await harness.conn.send("hello")
 
     event = localharness_pb2.OutputEvent(
         step_update=localharness_pb2.StepUpdate(
@@ -1690,7 +1657,7 @@ class LocalConnectionPostTurnHookTest(unittest.IsolatedAsyncioTestCase):
         )
     )
 
-    await self.mock_ws.put_event(event)
+    await harness.send_event(event)
 
     # The real harness sends STATE_IDLE after the final step. The
     # connection waits for this before returning from receive_steps().
@@ -1700,39 +1667,26 @@ class LocalConnectionPostTurnHookTest(unittest.IsolatedAsyncioTestCase):
             state=localharness_pb2.TrajectoryStateUpdate.STATE_IDLE,
         )
     )
-    await self.mock_ws.put_event(idle_event)
+    await harness.send_event(idle_event)
 
     # Drain receive_steps to trigger terminal detection + hook dispatch.
     steps = []
-    async for step in conn.receive_steps():
+    async for step in harness.conn.receive_steps():
       steps.append(step)
 
     self.assertEqual(len(steps), 1)
     self.assertEqual(captured, ["Final answer"])
 
   async def test_receive_steps_includes_target_environment(self):
-    """Verifies TARGET_ENVIRONMENT steps are yielded by receive_steps().
-
-    What: After removing the TARGET_ENVIRONMENT filter, environment-targeted
-    steps (tool executions like view_file, run_command) must flow through
-    receive_steps() alongside user-targeted steps.
-
-    Why: SDK consumers need a complete trajectory history. Previously,
-    environment steps were silently dropped, making it impossible to
-    observe internal tool activity.
-
-    How: Send two step updates — one TARGET_ENVIRONMENT (a tool permission
-    request) and one TARGET_USER (the final answer). Assert both are yielded,
-    and only the TARGET_USER step has is_complete_response=True.
-    """
-    conn = local_connection.LocalConnection(
+    """Verifies TARGET_ENVIRONMENT steps are yielded by receive_steps()."""
+    harness = test_utils.TestLocalHarness(
+        test_case=self,
         process=self.mock_process,
-        ws=self.mock_ws,
         tool_runner=self.tool_runner,
     )
 
     # Simulate a send to create turn context.
-    await conn.send("hello")
+    await harness.conn.send("hello")
 
     # Step 1: A TARGET_ENVIRONMENT step (tool execution).
     env_event = localharness_pb2.OutputEvent(
@@ -1767,12 +1721,12 @@ class LocalConnectionPostTurnHookTest(unittest.IsolatedAsyncioTestCase):
         )
     )
 
-    await self.mock_ws.put_event(env_event)
-    await self.mock_ws.put_event(user_event)
-    await self.mock_ws.put_event(idle_event)
+    await harness.send_event(env_event)
+    await harness.send_event(user_event)
+    await harness.send_event(idle_event)
 
     steps = []
-    async for step in conn.receive_steps():
+    async for step in harness.conn.receive_steps():
       steps.append(step)
 
     # Both steps must be yielded (the old filter would have dropped step 1).
@@ -1791,20 +1745,7 @@ class LocalConnectionPostTurnHookTest(unittest.IsolatedAsyncioTestCase):
     self.assertTrue(steps[1].is_complete_response)
 
   async def test_post_turn_hook_not_fired_for_environment_step(self):
-    """Verifies PostTurnHook does NOT fire for TARGET_ENVIRONMENT steps.
-
-    What: A terminal model step with target=TARGET_ENVIRONMENT must not
-    trigger the post-turn hook. Only TARGET_USER terminal steps should.
-
-    Why: Now that environment steps flow through receive_steps(), the
-    post-turn dispatch guard (which checks is_target_user) must correctly
-    skip them. Otherwise the hook would fire prematurely on tool execution
-    steps and clear the turn context before the real final response arrives.
-
-    How: Send a TARGET_ENVIRONMENT terminal model step followed by a
-    TARGET_USER terminal model step. Assert the post-turn hook fires
-    exactly once, with the content from the TARGET_USER step.
-    """
+    """Verifies PostTurnHook does NOT fire for TARGET_ENVIRONMENT steps."""
     captured = []
 
     class PostTurnHook:
@@ -1815,14 +1756,14 @@ class LocalConnectionPostTurnHookTest(unittest.IsolatedAsyncioTestCase):
     hr = hook_runner.HookRunner()
     hr.post_turn_hooks.append(PostTurnHook())
 
-    conn = local_connection.LocalConnection(
+    harness = test_utils.TestLocalHarness(
+        test_case=self,
         process=self.mock_process,
-        ws=self.mock_ws,
         tool_runner=self.tool_runner,
         hook_runner=hr,
     )
 
-    await conn.send("hello")
+    await harness.conn.send("hello")
 
     # A terminal environment step that should NOT trigger the hook.
     env_event = localharness_pb2.OutputEvent(
@@ -1857,12 +1798,12 @@ class LocalConnectionPostTurnHookTest(unittest.IsolatedAsyncioTestCase):
         )
     )
 
-    await self.mock_ws.put_event(env_event)
-    await self.mock_ws.put_event(user_event)
-    await self.mock_ws.put_event(idle_event)
+    await harness.send_event(env_event)
+    await harness.send_event(user_event)
+    await harness.send_event(idle_event)
 
     steps = []
-    async for step in conn.receive_steps():
+    async for step in harness.conn.receive_steps():
       steps.append(step)
 
     # Both steps yielded.
@@ -1878,27 +1819,28 @@ class LocalConnectionCompactionHookTest(unittest.IsolatedAsyncioTestCase):
   def setUp(self):
     super().setUp()
     self.mock_process = mock.MagicMock()
-    self.mock_ws = FakeWebSocket()
 
   async def test_compaction_step_dispatches_hook(self):
     """Verifies OnCompactionHook fires when a compaction step is received."""
     captured = []
+    event = asyncio.Event()
 
     class CompactionHook:
 
       async def run(self, context, data):  # pylint: disable=unused-argument
         captured.append(data)
+        event.set()
 
     hr = hook_runner.HookRunner()
     hr.on_compaction_hooks.append(CompactionHook())
 
-    local_connection.LocalConnection(
+    harness = test_utils.TestLocalHarness(
+        test_case=self,
         process=self.mock_process,
-        ws=self.mock_ws,
         hook_runner=hr,
     )
 
-    event = localharness_pb2.OutputEvent(
+    output_event = localharness_pb2.OutputEvent(
         step_update=localharness_pb2.StepUpdate(
             step_index=1,
             text="Context compaction",
@@ -1909,8 +1851,8 @@ class LocalConnectionCompactionHookTest(unittest.IsolatedAsyncioTestCase):
         )
     )
 
-    await self.mock_ws.put_event(event)
-    await asyncio.sleep(0.1)
+    await harness.send_event(output_event)
+    await asyncio.wait_for(event.wait(), timeout=1.0)
 
     self.assertEqual(len(captured), 1)
     self.assertIsInstance(captured[0], local_connection.LocalConnectionStep)
@@ -1928,19 +1870,19 @@ class LocalConnectionSubagentHookTest(unittest.IsolatedAsyncioTestCase):
   def setUp(self):
     super().setUp()
     self.mock_process = mock.MagicMock()
-    self.mock_ws = FakeWebSocket()
+    self.mock_ws = test_utils.TestWebSocket()
 
   async def test_invoke_subagent_step_classified_as_tool_call(self):
     """Verifies invoke_subagent steps are classified as TOOL_CALL."""
     hr = hook_runner.HookRunner()
 
-    conn = local_connection.LocalConnection(
+    harness = test_utils.TestLocalHarness(
+        test_case=self,
         process=self.mock_process,
-        ws=self.mock_ws,
         hook_runner=hr,
     )
 
-    await conn.send("hello")
+    await harness.conn.send("hello")
 
     event = localharness_pb2.OutputEvent(
         step_update=localharness_pb2.StepUpdate(
@@ -1954,28 +1896,29 @@ class LocalConnectionSubagentHookTest(unittest.IsolatedAsyncioTestCase):
         )
     )
 
-    await self.mock_ws.put_event(event)
-    await asyncio.sleep(0.1)
+    await harness.send_event(event)
 
     # Drain the queue to inspect the step.
-    step = conn._step_queue.get_nowait()
+    step = await asyncio.wait_for(harness.conn._step_queue.get(), timeout=2.0)
     self.assertEqual(step.type, types.StepType.TOOL_CALL)
 
   async def test_post_tool_hook_on_subagent_trajectory_idle(self):
     """Verifies post-tool-call hook fires when a non-main trajectory goes idle."""
+    hook_event = asyncio.Event()
     captured = []
 
     class PostToolHook:
 
       async def run(self, context, data):  # pylint: disable=unused-argument
         captured.append(data)
+        hook_event.set()
 
     hr = hook_runner.HookRunner()
     hr.post_tool_call_hooks.append(PostToolHook())
 
-    conn = local_connection.LocalConnection(
+    harness = test_utils.TestLocalHarness(
+        test_case=self,
         process=self.mock_process,
-        ws=self.mock_ws,
         hook_runner=hr,
     )
 
@@ -1991,10 +1934,11 @@ class LocalConnectionSubagentHookTest(unittest.IsolatedAsyncioTestCase):
             source=localharness_pb2.StepUpdate.SOURCE_MODEL,
         )
     )
-    await self.mock_ws.put_event(main_step)
-    await asyncio.sleep(0.1)
+    await harness.send_event(main_step)
+    # Wait for it to be processed by draining queue
+    await asyncio.wait_for(harness.conn._step_queue.get(), timeout=2.0)
 
-    self.assertEqual(conn._cascade_id, "main_traj")
+    self.assertEqual(harness.conn._cascade_id, "main_traj")
 
     # Simulate a subagent model step with text (may arrive as ACTIVE first).
     sub_active = localharness_pb2.OutputEvent(
@@ -2008,8 +1952,9 @@ class LocalConnectionSubagentHookTest(unittest.IsolatedAsyncioTestCase):
             target=localharness_pb2.StepUpdate.TARGET_USER,
         )
     )
-    await self.mock_ws.put_event(sub_active)
-    await asyncio.sleep(0.1)
+    await harness.send_event(sub_active)
+    # Wait for it to be processed by draining queue
+    await asyncio.wait_for(harness.conn._step_queue.get(), timeout=2.0)
 
     # Now simulate the subagent trajectory going idle.
     idle_event = localharness_pb2.OutputEvent(
@@ -2018,14 +1963,12 @@ class LocalConnectionSubagentHookTest(unittest.IsolatedAsyncioTestCase):
             state=localharness_pb2.TrajectoryStateUpdate.STATE_IDLE,
         )
     )
-    await self.mock_ws.put_event(idle_event)
-    await asyncio.sleep(0.1)
+    await harness.send_event(idle_event)
+    await harness.wait_for_event(hook_event)
 
     self.assertEqual(len(captured), 1)
     self.assertIsInstance(captured[0], types.ToolResult)
     self.assertEqual(captured[0].name, types.BuiltinTools.START_SUBAGENT.value)
-    # The result should contain the subagent's final response, not just
-    # the trajectory ID.
     self.assertEqual(captured[0].result, "Here is a poem about nature.")
 
     # Main trajectory idle should NOT fire post-tool hook for subagent.
@@ -2035,8 +1978,10 @@ class LocalConnectionSubagentHookTest(unittest.IsolatedAsyncioTestCase):
             state=localharness_pb2.TrajectoryStateUpdate.STATE_IDLE,
         )
     )
-    await self.mock_ws.put_event(main_idle)
-    await asyncio.sleep(0.1)
+    await harness.send_event(main_idle)
+
+    # Wait a tiny bit to ensure it didn't fire
+    await asyncio.sleep(0.01)
 
     # Still only 1 capture.
     self.assertEqual(len(captured), 1)
@@ -2044,9 +1989,9 @@ class LocalConnectionSubagentHookTest(unittest.IsolatedAsyncioTestCase):
   async def test_subagent_running_tracked(self):
     """Verifies STATE_RUNNING adds subagent to active set."""
     hr = hook_runner.HookRunner()
-    conn = local_connection.LocalConnection(
+    harness = test_utils.TestLocalHarness(
+        test_case=self,
         process=self.mock_process,
-        ws=self.mock_ws,
         hook_runner=hr,
     )
 
@@ -2061,8 +2006,9 @@ class LocalConnectionSubagentHookTest(unittest.IsolatedAsyncioTestCase):
             source=localharness_pb2.StepUpdate.SOURCE_MODEL,
         )
     )
-    await self.mock_ws.put_event(main_step)
-    await asyncio.sleep(0.1)
+    await harness.send_event(main_step)
+    # Wait for it to be processed
+    await asyncio.wait_for(harness.conn._step_queue.get(), timeout=2.0)
 
     # Subagent starts running.
     running_event = localharness_pb2.OutputEvent(
@@ -2071,21 +2017,28 @@ class LocalConnectionSubagentHookTest(unittest.IsolatedAsyncioTestCase):
             state=(localharness_pb2.TrajectoryStateUpdate.STATE_RUNNING),
         )
     )
-    await self.mock_ws.put_event(running_event)
-    await asyncio.sleep(0.1)
+    await harness.send_event(running_event)
 
-    self.assertIn("sub_1", conn._active_subagent_ids)
+    # Poll for the state change to be processed
+    async def poll_subagent_tracked():
+      while "sub_1" not in harness.conn._active_subagent_ids:
+        await asyncio.sleep(0.01)
+      return True
+
+    await asyncio.wait_for(poll_subagent_tracked(), timeout=2.0)
+
+    self.assertIn("sub_1", harness.conn._active_subagent_ids)
 
   async def test_connection_waits_for_subagents_before_idle(self):
     """Verifies receive_steps blocks until subagents complete."""
     hr = hook_runner.HookRunner()
-    conn = local_connection.LocalConnection(
+    harness = test_utils.TestLocalHarness(
+        test_case=self,
         process=self.mock_process,
-        ws=self.mock_ws,
         hook_runner=hr,
     )
 
-    await conn.send("hello")
+    await harness.conn.send("hello")
 
     # Establish cascade_id + a step.
     main_step = localharness_pb2.OutputEvent(
@@ -2098,10 +2051,12 @@ class LocalConnectionSubagentHookTest(unittest.IsolatedAsyncioTestCase):
             source=localharness_pb2.StepUpdate.SOURCE_MODEL,
         )
     )
-    await self.mock_ws.put_event(main_step)
+    await harness.send_event(main_step)
+    # Wait for it to be processed
+    await asyncio.wait_for(harness.conn._step_queue.get(), timeout=2.0)
 
     # Subagent starts.
-    await self.mock_ws.put_event(
+    await harness.send_event(
         localharness_pb2.OutputEvent(
             trajectory_state_update=localharness_pb2.TrajectoryStateUpdate(
                 trajectory_id="sub_1",
@@ -2111,7 +2066,7 @@ class LocalConnectionSubagentHookTest(unittest.IsolatedAsyncioTestCase):
     )
 
     # Parent goes idle, but subagent still running.
-    await self.mock_ws.put_event(
+    await harness.send_event(
         localharness_pb2.OutputEvent(
             trajectory_state_update=localharness_pb2.TrajectoryStateUpdate(
                 trajectory_id="main",
@@ -2119,13 +2074,20 @@ class LocalConnectionSubagentHookTest(unittest.IsolatedAsyncioTestCase):
             )
         )
     )
-    await asyncio.sleep(0.1)
+
+    # Poll for parent_idle to be True
+    async def poll_parent_idle():
+      while not harness.conn._parent_idle:
+        await asyncio.sleep(0.01)
+      return True
+
+    await asyncio.wait_for(poll_parent_idle(), timeout=2.0)
 
     # _is_idle should NOT be set yet.
-    self.assertFalse(conn._is_idle.is_set())
+    self.assertFalse(harness.conn._is_idle.is_set())
 
     # Subagent completes.
-    await self.mock_ws.put_event(
+    await harness.send_event(
         localharness_pb2.OutputEvent(
             trajectory_state_update=localharness_pb2.TrajectoryStateUpdate(
                 trajectory_id="sub_1",
@@ -2133,31 +2095,33 @@ class LocalConnectionSubagentHookTest(unittest.IsolatedAsyncioTestCase):
             )
         )
     )
-    await asyncio.sleep(0.1)
+
+    # Wait for _is_idle to be set
+    await asyncio.wait_for(harness.conn._is_idle.wait(), timeout=2.0)
 
     # NOW idle should be set.
-    self.assertTrue(conn._is_idle.is_set())
+    self.assertTrue(harness.conn._is_idle.is_set())
 
   async def test_send_resets_subagent_tracking(self):
     """Verifies send() clears subagent tracking state."""
     hr = hook_runner.HookRunner()
-    conn = local_connection.LocalConnection(
+    harness = test_utils.TestLocalHarness(
+        test_case=self,
         process=self.mock_process,
-        ws=self.mock_ws,
         hook_runner=hr,
     )
 
     # Pollute tracking state.
-    conn._active_subagent_ids.add("leftover")
-    conn._subagent_responses["leftover"] = "stale response"
-    conn._parent_idle = True
+    harness.conn._active_subagent_ids.add("leftover")
+    harness.conn._subagent_responses["leftover"] = "stale response"
+    harness.conn._parent_idle = True
 
-    await conn.send("new turn")
+    await harness.conn.send("new turn")
 
-    self.assertEqual(conn._active_subagent_ids, set())
-    self.assertEqual(conn._subagent_responses, {})
-    self.assertFalse(conn._parent_idle)
-    self.assertFalse(conn._is_idle.is_set())
+    self.assertEqual(harness.conn._active_subagent_ids, set())
+    self.assertEqual(harness.conn._subagent_responses, {})
+    self.assertFalse(harness.conn._parent_idle)
+    self.assertFalse(harness.conn._is_idle.is_set())
 
 
 class LocalConnectionToolCallHooksTest(unittest.IsolatedAsyncioTestCase):
@@ -2166,16 +2130,18 @@ class LocalConnectionToolCallHooksTest(unittest.IsolatedAsyncioTestCase):
   def setUp(self):
     super().setUp()
     self.mock_process = mock.MagicMock()
-    self.mock_ws = FakeWebSocket()
+    self.mock_ws = test_utils.TestWebSocket()
 
   async def test_post_tool_call_hook_dispatched(self):
     """Verifies PostToolCallHook fires after successful tool execution."""
+    hook_event = asyncio.Event()
     captured_results = []
 
     class PostToolHook:
 
       async def run(self, context, data):  # pylint: disable=unused-argument
         captured_results.append(data)
+        hook_event.set()
 
     tr = tool_runner.ToolRunner()
 
@@ -2187,9 +2153,9 @@ class LocalConnectionToolCallHooksTest(unittest.IsolatedAsyncioTestCase):
     hr = hook_runner.HookRunner()
     hr.post_tool_call_hooks.append(PostToolHook())
 
-    local_connection.LocalConnection(
+    harness = test_utils.TestLocalHarness(
+        test_case=self,
         process=self.mock_process,
-        ws=self.mock_ws,
         tool_runner=tr,
         hook_runner=hr,
     )
@@ -2202,8 +2168,8 @@ class LocalConnectionToolCallHooksTest(unittest.IsolatedAsyncioTestCase):
         )
     )
 
-    await self.mock_ws.put_event(event)
-    await asyncio.sleep(0.1)
+    await harness.send_event(event)
+    await harness.wait_for_event(hook_event)
 
     self.assertEqual(len(captured_results), 1)
 
@@ -2225,9 +2191,9 @@ class LocalConnectionToolCallHooksTest(unittest.IsolatedAsyncioTestCase):
     hr = hook_runner.HookRunner()
     hr.on_tool_error_hooks.append(RecoveringErrorHook())
 
-    local_connection.LocalConnection(
+    harness = test_utils.TestLocalHarness(
+        test_case=self,
         process=self.mock_process,
-        ws=self.mock_ws,
         tool_runner=tr,
         hook_runner=hr,
     )
@@ -2240,12 +2206,10 @@ class LocalConnectionToolCallHooksTest(unittest.IsolatedAsyncioTestCase):
         )
     )
 
-    await self.mock_ws.put_event(event)
-    await asyncio.sleep(0.1)
+    await harness.send_event(event)
 
     # The recovery value should have been sent back.
-    self.assertEqual(len(self.mock_ws.sent_messages), 1)
-    sent_data = json.loads(self.mock_ws.sent_messages[0])
+    sent_data = await harness.wait_for_response()
     self.assertIn("toolResponse", sent_data)
     self.assertIn("recovered_value", sent_data["toolResponse"]["responseJson"])
 
@@ -2256,12 +2220,14 @@ class LocalConnectionToolCallHooksTest(unittest.IsolatedAsyncioTestCase):
     ValueError (not a RuntimeError wrapping the error string) so that
     isinstance-based dispatch works in hook implementations.
     """
+    hook_event = asyncio.Event()
     captured_errors = []
 
     class CapturingErrorHook:
 
       async def run(self, context, data):  # pylint: disable=unused-argument
         captured_errors.append(data)
+        hook_event.set()
         return "recovered"
 
     tr = tool_runner.ToolRunner()
@@ -2274,9 +2240,9 @@ class LocalConnectionToolCallHooksTest(unittest.IsolatedAsyncioTestCase):
     hr = hook_runner.HookRunner()
     hr.on_tool_error_hooks.append(CapturingErrorHook())
 
-    local_connection.LocalConnection(
+    harness = test_utils.TestLocalHarness(
+        test_case=self,
         process=self.mock_process,
-        ws=self.mock_ws,
         tool_runner=tr,
         hook_runner=hr,
     )
@@ -2289,8 +2255,8 @@ class LocalConnectionToolCallHooksTest(unittest.IsolatedAsyncioTestCase):
         )
     )
 
-    await self.mock_ws.put_event(event)
-    await asyncio.sleep(0.1)
+    await harness.send_event(event)
+    await harness.wait_for_event(hook_event)
 
     self.assertEqual(len(captured_errors), 1)
     # The hook must receive the original ValueError, not RuntimeError.
@@ -2299,15 +2265,13 @@ class LocalConnectionToolCallHooksTest(unittest.IsolatedAsyncioTestCase):
     self.assertIn("bad input", str(captured_errors[0]))
 
 
-class LocalConnectionBuiltinDecideHookTest(
-    unittest.IsolatedAsyncioTestCase
-):
+class LocalConnectionBuiltinDecideHookTest(unittest.IsolatedAsyncioTestCase):
   """Verifies Decide hooks run for built-in tool confirmations."""
 
   def setUp(self):
     super().setUp()
     self.mock_process = mock.MagicMock()
-    self.mock_ws = FakeWebSocket()
+    self.mock_ws = test_utils.TestWebSocket()
 
   async def test_decide_hooks_run_for_builtin_tools(self):
     """Verifies PreToolCallDecideHook runs and can deny builtin tools."""
@@ -2318,9 +2282,9 @@ class LocalConnectionBuiltinDecideHookTest(
         return hooks_base.HookResult(allow=False, message="Denied")
 
     hr = hook_runner.HookRunner(pre_tool_call_decide_hooks=[DenyAll()])
-    _ = local_connection.LocalConnection(
+    harness = test_utils.TestLocalHarness(
+        test_case=self,
         process=self.mock_process,
-        ws=self.mock_ws,
         hook_runner=hr,
     )
 
@@ -2341,10 +2305,9 @@ class LocalConnectionBuiltinDecideHookTest(
             ),
         )
     )
-    await self.mock_ws.put_event(event)
-    await asyncio.sleep(0.1)
+    await harness.send_event(event)
 
-    sent = json.loads(self.mock_ws.sent_messages[0])
+    sent = await harness.wait_for_response()
     self.assertFalse(sent["toolConfirmation"]["accepted"])
 
 
@@ -2354,7 +2317,7 @@ class LocalConnectionHookAcceptanceTest(unittest.IsolatedAsyncioTestCase):
   def setUp(self):
     super().setUp()
     self.mock_process = mock.MagicMock()
-    self.mock_ws = FakeWebSocket()
+    self.mock_ws = test_utils.TestWebSocket()
 
   async def test_subagent_tool_hooks_accepted(self):
     """Subagent lifecycle is handled by tool hooks; no special subagent lists."""
@@ -2368,9 +2331,9 @@ class LocalConnectionHookAcceptanceTest(unittest.IsolatedAsyncioTestCase):
     hr.pre_tool_call_decide_hooks.append(DummyHook())
 
     # Should NOT raise.
-    local_connection.LocalConnection(
+    test_utils.TestLocalHarness(
+        test_case=self,
         process=self.mock_process,
-        ws=self.mock_ws,
         hook_runner=hr,
     )
 
@@ -2386,9 +2349,9 @@ class LocalConnectionHookAcceptanceTest(unittest.IsolatedAsyncioTestCase):
     hr.on_compaction_hooks.append(DummyHook())
 
     # Should NOT raise.
-    local_connection.LocalConnection(
+    test_utils.TestLocalHarness(
+        test_case=self,
         process=self.mock_process,
-        ws=self.mock_ws,
         hook_runner=hr,
     )
 
@@ -2399,7 +2362,7 @@ class LocalConnectionStderrReaderTest(unittest.IsolatedAsyncioTestCase):
   def setUp(self):
     super().setUp()
     self.mock_process = mock.MagicMock()
-    self.mock_ws = FakeWebSocket()
+    self.mock_ws = test_utils.TestWebSocket()
 
   async def test_start_stderr_reader_drains_lines(self):
     """Verifies that _start_stderr_reader captures stderr lines.
@@ -2411,16 +2374,18 @@ class LocalConnectionStderrReaderTest(unittest.IsolatedAsyncioTestCase):
     contains all written lines.
     """
 
-    conn = local_connection.LocalConnection(
+    harness = test_utils.TestLocalHarness(
+        test_case=self,
         process=self.mock_process,
-        ws=self.mock_ws,
     )
 
     stream = io.BytesIO(b"line1\nline2\nline3\n")
-    conn._start_stderr_reader(stream)
-    conn._stderr_thread.join(timeout=2)
+    harness.conn._start_stderr_reader(stream)
+    harness.conn._stderr_thread.join(timeout=2)
 
-    self.assertEqual(list(conn._stderr_lines), ["line1", "line2", "line3"])
+    self.assertEqual(
+        list(harness.conn._stderr_lines), ["line1", "line2", "line3"]
+    )
 
   async def test_stderr_reader_respects_maxlen(self):
     """Verifies the deque drops old lines when it exceeds maxlen.
@@ -2430,19 +2395,19 @@ class LocalConnectionStderrReaderTest(unittest.IsolatedAsyncioTestCase):
     How: Write 105 lines and confirm only the last 100 remain.
     """
 
-    conn = local_connection.LocalConnection(
+    harness = test_utils.TestLocalHarness(
+        test_case=self,
         process=self.mock_process,
-        ws=self.mock_ws,
     )
 
     lines = "".join(f"line{i}\n" for i in range(105))
     stream = io.BytesIO(lines.encode())
-    conn._start_stderr_reader(stream)
-    conn._stderr_thread.join(timeout=2)
+    harness.conn._start_stderr_reader(stream)
+    harness.conn._stderr_thread.join(timeout=2)
 
-    self.assertEqual(len(conn._stderr_lines), 100)
-    self.assertEqual(conn._stderr_lines[0], "line5")
-    self.assertEqual(conn._stderr_lines[-1], "line104")
+    self.assertEqual(len(harness.conn._stderr_lines), 100)
+    self.assertEqual(harness.conn._stderr_lines[0], "line5")
+    self.assertEqual(harness.conn._stderr_lines[-1], "line104")
 
   async def test_stderr_reader_handles_closed_stream(self):
     """Verifies the reader thread exits cleanly when the stream closes.
@@ -2452,15 +2417,15 @@ class LocalConnectionStderrReaderTest(unittest.IsolatedAsyncioTestCase):
     How: Pass an already-closed stream and verify the thread exits without
     raising.
     """
-    conn = local_connection.LocalConnection(
+    harness = test_utils.TestLocalHarness(
+        test_case=self,
         process=self.mock_process,
-        ws=self.mock_ws,
     )
 
     stream = io.BytesIO(b"")
-    conn._start_stderr_reader(stream)
-    conn._stderr_thread.join(timeout=2)
-    self.assertFalse(conn._stderr_thread.is_alive())
+    harness.conn._start_stderr_reader(stream)
+    harness.conn._stderr_thread.join(timeout=2)
+    self.assertFalse(harness.conn._stderr_thread.is_alive())
 
   async def test_stderr_reader_thread_is_daemon(self):
     """Verifies the stderr reader thread is a daemon thread.
@@ -2470,15 +2435,15 @@ class LocalConnectionStderrReaderTest(unittest.IsolatedAsyncioTestCase):
     indefinitely.
     How: Start the reader and check the thread's daemon attribute.
     """
-    conn = local_connection.LocalConnection(
+    harness = test_utils.TestLocalHarness(
+        test_case=self,
         process=self.mock_process,
-        ws=self.mock_ws,
     )
 
     stream = io.BytesIO(b"line1\n")
-    conn._start_stderr_reader(stream)
-    self.assertTrue(conn._stderr_thread.daemon)
-    conn._stderr_thread.join(timeout=2)
+    harness.conn._start_stderr_reader(stream)
+    self.assertTrue(harness.conn._stderr_thread.daemon)
+    harness.conn._stderr_thread.join(timeout=2)
 
 
 class LocalConnectionDisconnectTest(unittest.IsolatedAsyncioTestCase):
@@ -2489,7 +2454,7 @@ class LocalConnectionDisconnectTest(unittest.IsolatedAsyncioTestCase):
     self.mock_process = mock.MagicMock()
     self.mock_process.stdin = mock.MagicMock()
     self.mock_process.wait.return_value = 0
-    self.mock_ws = FakeWebSocket()
+    self.mock_ws = test_utils.TestWebSocket()
 
   async def test_disconnect_sets_disconnecting_flag(self):
     """Verifies _disconnecting is set before any cleanup runs.
@@ -2498,12 +2463,12 @@ class LocalConnectionDisconnectTest(unittest.IsolatedAsyncioTestCase):
     from harness crashes.  It must be set early in disconnect().
     How: Call disconnect and check the flag is True.
     """
-    conn = local_connection.LocalConnection(
+    harness = test_utils.TestLocalHarness(
+        test_case=self,
         process=self.mock_process,
-        ws=self.mock_ws,
     )
-    await conn.disconnect()
-    self.assertTrue(conn._disconnecting)
+    await harness.disconnect_sdk()
+    self.assertTrue(harness.conn._disconnecting)
 
   async def test_disconnect_closes_stdin(self):
     """Verifies stdin is closed during disconnect to trigger harness save.
@@ -2513,11 +2478,11 @@ class LocalConnectionDisconnectTest(unittest.IsolatedAsyncioTestCase):
     closing stdin, the trajectory is never saved.
     How: Call disconnect and verify stdin.close() was called.
     """
-    conn = local_connection.LocalConnection(
+    harness = test_utils.TestLocalHarness(
+        test_case=self,
         process=self.mock_process,
-        ws=self.mock_ws,
     )
-    await conn.disconnect()
+    await harness.disconnect_sdk()
     self.mock_process.stdin.close.assert_called_once()
 
   async def test_disconnect_waits_for_process(self):
@@ -2527,11 +2492,11 @@ class LocalConnectionDisconnectTest(unittest.IsolatedAsyncioTestCase):
     closes.  Killing it immediately would lose the trajectory.
     How: Call disconnect and verify process.wait(timeout=5) was called.
     """
-    conn = local_connection.LocalConnection(
+    harness = test_utils.TestLocalHarness(
+        test_case=self,
         process=self.mock_process,
-        ws=self.mock_ws,
     )
-    await conn.disconnect()
+    await harness.disconnect_sdk()
     self.mock_process.wait.assert_called_with(timeout=5)
 
   async def test_disconnect_terminates_on_timeout(self):
@@ -2546,11 +2511,11 @@ class LocalConnectionDisconnectTest(unittest.IsolatedAsyncioTestCase):
         subprocess.TimeoutExpired("cmd", 5),  # First wait times out.
         0,  # After terminate, process exits.
     ]
-    conn = local_connection.LocalConnection(
+    harness = test_utils.TestLocalHarness(
+        test_case=self,
         process=self.mock_process,
-        ws=self.mock_ws,
     )
-    await conn.disconnect()
+    await harness.disconnect_sdk()
     self.mock_process.terminate.assert_called_once()
 
   async def test_disconnect_kills_on_double_timeout(self):
@@ -2564,11 +2529,11 @@ class LocalConnectionDisconnectTest(unittest.IsolatedAsyncioTestCase):
         subprocess.TimeoutExpired("cmd", 1),  # After terminate.
         0,  # After kill.
     ]
-    conn = local_connection.LocalConnection(
+    harness = test_utils.TestLocalHarness(
+        test_case=self,
         process=self.mock_process,
-        ws=self.mock_ws,
     )
-    await conn.disconnect()
+    await harness.disconnect_sdk()
     self.mock_process.terminate.assert_called_once()
     self.mock_process.kill.assert_called_once()
 
@@ -2583,22 +2548,24 @@ class LocalConnectionDisconnectTest(unittest.IsolatedAsyncioTestCase):
     How: Record the call order of ws.close and stdin.close.
     """
     call_order = []
-    original_close = self.mock_ws.close
+
+    harness = test_utils.TestLocalHarness(
+        test_case=self,
+        process=self.mock_process,
+    )
+
+    original_close = harness.ws.close
 
     async def track_ws_close():
       call_order.append("ws_close")
       await original_close()
 
-    self.mock_ws.close = track_ws_close
+    harness.ws.close = track_ws_close
     self.mock_process.stdin.close.side_effect = lambda: call_order.append(
         "stdin_close"
     )
 
-    conn = local_connection.LocalConnection(
-        process=self.mock_process,
-        ws=self.mock_ws,
-    )
-    await conn.disconnect()
+    await harness.disconnect_sdk()
     self.assertEqual(call_order, ["ws_close", "stdin_close"])
 
 
@@ -2646,9 +2613,6 @@ class LocalConnectionUnexpectedCloseTest(unittest.IsolatedAsyncioTestCase):
     # Seed some stderr context.
     conn._stderr_lines.append("Failed to call model: quota exceeded")
 
-    # Wait for reader loop to process the crash.
-    await asyncio.sleep(0.1)
-
     # The step queue should contain the error, then the sentinel None.
     item = await asyncio.wait_for(conn._step_queue.get(), timeout=2)
     self.assertIsInstance(item, types.AntigravityConnectionError)
@@ -2689,9 +2653,6 @@ class LocalConnectionUnexpectedCloseTest(unittest.IsolatedAsyncioTestCase):
     )
     conn._disconnecting = True
 
-    # Wait for reader loop.
-    await asyncio.sleep(0.1)
-
     # Should only see the sentinel, not an error.
     item = await asyncio.wait_for(conn._step_queue.get(), timeout=2)
     self.assertIsNone(item)
@@ -2703,32 +2664,29 @@ class LocalConnectionSendTest(unittest.IsolatedAsyncioTestCase):
   def setUp(self):
     super().setUp()
     self.mock_process = mock.MagicMock()
-    self.mock_ws = FakeWebSocket()
+    self.mock_ws = test_utils.TestWebSocket()
 
   async def test_send_flat_string_populates_user_input(self):
     """Verifies that a standard string prompt maps to the user_input proto field."""
-    conn = local_connection.LocalConnection(
+    harness = test_utils.TestLocalHarness(
+        test_case=self,
         process=self.mock_process,
-        ws=self.mock_ws,
     )
-    await conn.send("Standard text prompt")
+    await harness.conn.send("Standard text prompt")
 
-    self.assertEqual(len(self.mock_ws.sent_messages), 1)
-    sent_data = json.loads(self.mock_ws.sent_messages[0])
-
+    sent_data = await harness.wait_for_response()
     self.assertEqual(sent_data.get("userInput"), "Standard text prompt")
     self.assertNotIn("complexUserInput", sent_data)
 
   async def test_send_none_prompt_populates_blank_string(self):
     """Verifies that passing a prompt of None maps to a blank userInput string frame."""
-    conn = local_connection.LocalConnection(
+    harness = test_utils.TestLocalHarness(
+        test_case=self,
         process=self.mock_process,
-        ws=self.mock_ws,
     )
-    await conn.send(None)
+    await harness.conn.send(None)
 
-    self.assertEqual(len(self.mock_ws.sent_messages), 1)
-    sent_data = json.loads(self.mock_ws.sent_messages[0])
+    sent_data = await harness.wait_for_response()
 
     # Assert it sets userInput to a blank string and does not use complex inputs
     self.assertEqual(sent_data.get("userInput"), "")
@@ -2736,19 +2694,18 @@ class LocalConnectionSendTest(unittest.IsolatedAsyncioTestCase):
 
   async def test_send_single_media_content_populates_complex_user_input(self):
     """Verifies that a single rich Content primitive maps to the complex_user_input parts list."""
-    conn = local_connection.LocalConnection(
+    harness = test_utils.TestLocalHarness(
+        test_case=self,
         process=self.mock_process,
-        ws=self.mock_ws,
     )
     image_content = types.Image(
         mime_type="image/png",
         data=b"fake_png",
         description="logo image",
     )
-    await conn.send(image_content)
+    await harness.conn.send(image_content)
 
-    self.assertEqual(len(self.mock_ws.sent_messages), 1)
-    sent_data = json.loads(self.mock_ws.sent_messages[0])
+    sent_data = await harness.wait_for_response()
 
     self.assertNotIn("userInput", sent_data)
     self.assertIn("complexUserInput", sent_data)
@@ -2764,18 +2721,17 @@ class LocalConnectionSendTest(unittest.IsolatedAsyncioTestCase):
 
   async def test_send_mixed_list_populates_multiple_complex_content(self):
     """Verifies that a list containing both strings and rich Content primitives compiles correctly to spec."""
-    conn = local_connection.LocalConnection(
+    harness = test_utils.TestLocalHarness(
+        test_case=self,
         process=self.mock_process,
-        ws=self.mock_ws,
     )
     mixed_prompt = [
         "Context text instruction.",
         types.Document(mime_type="application/pdf", data=b"fake_pdf"),
     ]
-    await conn.send(mixed_prompt)
+    await harness.conn.send(mixed_prompt)
 
-    self.assertEqual(len(self.mock_ws.sent_messages), 1)
-    sent_data = json.loads(self.mock_ws.sent_messages[0])
+    sent_data = await harness.wait_for_response()
 
     self.assertNotIn("userInput", sent_data)
     self.assertIn("complexUserInput", sent_data)
