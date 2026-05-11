@@ -44,7 +44,6 @@ from google.antigravity.hooks import hook_runner as hooks_runner
 from google.antigravity.hooks import policy
 from google.antigravity.mcp.bridge import McpBridge
 from google.antigravity.tools.tool_runner import ToolRunner
-from google.antigravity.utils import cli_utils
 
 _MODEL_NAME = flags.DEFINE_string(
     "model_name", "gemini-3-flash-preview", "Gemini model name."
@@ -155,16 +154,17 @@ async def run():
     logging.info("Starting agent...")
     async with Agent(config) as agent:
 
-      cli_utils.print_cli_header("Antigravity SDK Demo")
+      print("\nAntigravity SDK Demo")
+      print("Type your message and press Enter • Ctrl+C to exit\n")
 
       while True:
         try:
-          user_input = await asyncio.to_thread(input, cli_utils.INPUT_PROMPT)
+          user_input = await asyncio.to_thread(input, "\n→ ")
           user_input = user_input.strip()
           if not user_input:
             continue
           if user_input.lower() in ("exit", "quit"):
-            print(cli_utils.GOODBYE_MSG)
+            print("\nGoodbye! 👋")
             break
 
           response = await agent.chat(user_input)
@@ -184,7 +184,7 @@ async def run():
             )
 
         except (KeyboardInterrupt, asyncio.CancelledError, EOFError):
-          print(cli_utils.GOODBYE_MSG)
+          print("\nGoodbye! 👋")
           break
 
   except Exception as e:  # pylint: disable=broad-exception-caught

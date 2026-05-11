@@ -38,7 +38,6 @@ from absl import logging
 from google.antigravity import types
 from google.antigravity.agent import Agent
 from google.antigravity.connections.local.local_connection_config import LocalAgentConfig
-from google.antigravity.utils import cli_utils
 
 _MODEL_NAME = flags.DEFINE_string(
     "model_name", "gemini-3-flash-preview", "Gemini model name."
@@ -77,17 +76,18 @@ async def run():
     )
     async with Agent(config) as agent:
 
-      cli_utils.print_cli_header("Thinking Example")
+      print("\nThinking Example")
+      print("Type your message and press Enter • Ctrl+C to exit")
       print("Ask a question to see the model's reasoning process.\n")
 
       while True:
         try:
-          user_input = await asyncio.to_thread(input, cli_utils.INPUT_PROMPT)
+          user_input = await asyncio.to_thread(input, "\n→ ")
           user_input = user_input.strip()
           if not user_input:
             continue
           if user_input.lower() in ("exit", "quit"):
-            print(cli_utils.GOODBYE_MSG)
+            print("\nGoodbye! 👋")
             break
 
           response = await agent.chat(user_input)
@@ -103,7 +103,7 @@ async def run():
           print("\n")
 
         except (KeyboardInterrupt, asyncio.CancelledError, EOFError):
-          print(cli_utils.GOODBYE_MSG)
+          print("\nGoodbye! 👋")
           break
 
   except Exception as e:  # pylint: disable=broad-exception-caught
