@@ -25,10 +25,12 @@ Covers:
 - Edge cases (empty policy list, policy name in deny reason)
 """
 
+from collections.abc import Mapping
 from typing import Any
 import unittest
 
 import pydantic
+
 from google.antigravity import types
 from google.antigravity.hooks import hooks
 from google.antigravity.hooks import policy
@@ -205,7 +207,7 @@ class ShortCircuitTest(unittest.IsolatedAsyncioTestCase):
     """When two specific deny policies match, only the first is evaluated."""
     call_count = 0
 
-    def counting_predicate(unused_args: dict[str, Any]) -> bool:
+    def counting_predicate(unused_args: Mapping[str, Any]) -> bool:
       nonlocal call_count
       call_count += 1
       return True
@@ -224,7 +226,7 @@ class ShortCircuitTest(unittest.IsolatedAsyncioTestCase):
     """When two specific allow policies match, only the first is evaluated."""
     call_count = 0
 
-    def counting_predicate(unused_args: dict[str, Any]) -> bool:
+    def counting_predicate(unused_args: Mapping[str, Any]) -> bool:
       nonlocal call_count
       call_count += 1
       return True
@@ -284,7 +286,7 @@ class PredicateTest(unittest.IsolatedAsyncioTestCase):
   async def test_async_predicate_true(self):
     """Async predicate returning True causes the policy to match."""
 
-    async def is_dangerous(args: dict[str, Any]) -> bool:
+    async def is_dangerous(args: Mapping[str, Any]) -> bool:
       return "rm" in args.get("CommandLine", "")
 
     hook = policy.enforce([
@@ -299,7 +301,7 @@ class PredicateTest(unittest.IsolatedAsyncioTestCase):
   async def test_async_predicate_false(self):
     """Async predicate returning False skips the policy."""
 
-    async def is_dangerous(args: dict[str, Any]) -> bool:
+    async def is_dangerous(args: Mapping[str, Any]) -> bool:
       return "rm" in args.get("CommandLine", "")
 
     hook = policy.enforce([
@@ -318,7 +320,7 @@ class PredicateTest(unittest.IsolatedAsyncioTestCase):
     predicate still denies, preventing accidental allow-through.
     """
 
-    def exploding_predicate(args: dict[str, Any]) -> bool:
+    def exploding_predicate(_: Mapping[str, Any]) -> bool:
       raise RuntimeError("boom")
 
     hook = policy.enforce([
@@ -328,6 +330,7 @@ class PredicateTest(unittest.IsolatedAsyncioTestCase):
     result = await hook.run(ctx, _make_tool_call("run_command"))
     self.assertFalse(result.allow)
     self.assertIn("broken", result.message)
+    self.assertIn("boom", result.message)
 
   async def test_parameterless_predicate(self):
     """Predicate with no arguments should be called without arguments."""
@@ -340,12 +343,34 @@ class PredicateTest(unittest.IsolatedAsyncioTestCase):
     ])
     ctx = hooks.HookContext()
 
-    # This will call no_args_predicate(args) in policy.py:224,
-    # which will raise TypeError because it takes 0 args but 1 was given.
-    # It will be caught and fail-closed.
+    # This calls no_args_predicate() with 0 arguments.
+    # It succeeds and returns True (match), leading to denial.
     result = await hook.run(ctx, _make_tool_call("run_command"))
     self.assertFalse(result.allow)
-    self.assertIn("no-args", result.message)
+    self.assertEqual(result.message, "Denied by policy 'no-args'.")
+
+  async def test_parameterless_predicate_allow(self):
+    """Parameterless predicate in ALLOW policy works and allows/denies correctly."""
+    is_allowed = False
+
+    def my_predicate():
+      return is_allowed
+
+    hook = policy.enforce([
+        policy.allow("run_command", when=my_predicate, name="paramless-allow"),
+        policy.deny("*"),
+    ])
+    ctx = hooks.HookContext()
+
+    # When predicate returns False -> should deny (via deny("*"))
+    is_allowed = False
+    result = await hook.run(ctx, _make_tool_call("run_command"))
+    self.assertFalse(result.allow)
+
+    # When predicate returns True -> should allow
+    is_allowed = True
+    result = await hook.run(ctx, _make_tool_call("run_command"))
+    self.assertTrue(result.allow)
 
   async def test_typed_predicate(self):
 
@@ -370,6 +395,24 @@ class PredicateTest(unittest.IsolatedAsyncioTestCase):
         ctx, _make_tool_call("run_command", command_line="echo hi")
     )
     self.assertTrue(result.allow)
+
+  async def test_allow_predicate_exception_denies(self):
+    """Exception in allow policy predicate must deny (fail-closed)."""
+
+    def exploding_predicate(_: Mapping[str, Any]) -> bool:
+      raise RuntimeError("boom")
+
+    hook = policy.enforce([
+        policy.allow(
+            "run_command", when=exploding_predicate, name="broken-allow"
+        ),
+        policy.allow("*"),
+    ])
+    ctx = hooks.HookContext()
+    result = await hook.run(ctx, _make_tool_call("run_command"))
+    self.assertFalse(result.allow)
+    self.assertIn("broken-allow", result.message)
+    self.assertIn("boom", result.message)
 
 
 class AskUserTest(unittest.IsolatedAsyncioTestCase):
@@ -411,18 +454,22 @@ class AskUserTest(unittest.IsolatedAsyncioTestCase):
     result = await hook.run(ctx, _make_tool_call("run_command", safe=False))
     self.assertFalse(result.allow)
 
-  async def test_handler_exception_propagates(self):
-    """Handler exception propagates up, failing the tool call."""
+  async def test_handler_exception_denies(self):
+    """Handler exception is caught and denies the tool call."""
 
-    def broken_handler(tc: types.ToolCall) -> bool:
+    def broken_handler(_: types.ToolCall) -> bool:
       raise RuntimeError("handler broke")
 
     hook = policy.enforce([
-        policy.ask_user("run_command", handler=broken_handler),
+        policy.ask_user(
+            "run_command", handler=broken_handler, name="broken-ask"
+        ),
     ])
     ctx = hooks.HookContext()
-    with self.assertRaises(RuntimeError):
-      await hook.run(ctx, _make_tool_call("run_command"))
+    result = await hook.run(ctx, _make_tool_call("run_command"))
+    self.assertFalse(result.allow)
+    self.assertIn("broken-ask", result.message)
+    self.assertIn("handler broke", result.message)
 
   async def test_handler_receives_tool_call(self):
     """Handler receives the full ToolCall object, not just args."""

@@ -66,7 +66,7 @@ Usage:
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 import dataclasses
 import enum
 import inspect
@@ -86,7 +86,7 @@ _logger = logging.getLogger(__name__)
 # A predicate receives the tool call's argument dict (or a Pydantic model,
 # if the predicate's first parameter is annotated with a BaseModel subclass)
 # and returns whether the policy applies. Supports both sync and async.
-Predicate = Callable[[Any], bool | Awaitable[bool]]
+Predicate = Callable[..., bool | Awaitable[bool]]
 
 # An ask_user handler receives the full ToolCall and returns whether the
 # user approved execution. Supports both sync and async callables.
@@ -385,50 +385,40 @@ def _matches_tool(policy: Policy, tool_name: str) -> bool:
   return policy.tool == _WILDCARD or policy.tool == tool_name
 
 
-async def _evaluate_predicate(policy: Policy, args: dict[str, Any]) -> bool:
-  """Evaluates a policy's predicate, failing closed on exceptions.
+async def _evaluate_predicate(policy: Policy, args: Mapping[str, Any]) -> bool:
+  """Evaluates a policy's predicate.
 
   If the predicate is None, the policy always matches.
-  If the predicate raises, the policy matches (fail-closed).
+  Exceptions are propagated to the caller.
 
   Args:
     policy: The policy being evaluated.
     args: The arguments of the tool call.
 
   Returns:
-    True if the predicate matches or raises an exception, False otherwise.
+    True if the predicate matches, False otherwise.
   """
   if policy.when is None:
     return True
-  try:
-    sig = inspect.signature(policy.when)
-    params = list(sig.parameters.values())
 
-    if params:
-      first_param = params[0]
-      annotation = first_param.annotation
-      if isinstance(annotation, type) and issubclass(
-          annotation, pydantic.BaseModel
-      ):
-        typed_args = annotation.model_validate(args)
-        result = policy.when(typed_args)
-      else:
-        result = policy.when(args)
-    else:
-      result = policy.when(args)
+  sig = inspect.signature(policy.when)
+  params = list(sig.parameters.values())
 
-    if inspect.isawaitable(result):
-      result = await result
-    return bool(result)
-  except Exception:  # pylint: disable=broad-exception-caught
-    _logger.warning(
-        "Predicate exception in policy %r for tool %r — treating as match"
-        " (fail-closed).",
-        policy.name or "<unnamed>",
-        policy.tool,
-        exc_info=True,
-    )
-    return True
+  first_param = params[0] if params else None
+  if (
+      first_param
+      and isinstance(first_param.annotation, type)
+      and issubclass(first_param.annotation, pydantic.BaseModel)
+  ):
+    typed_args = first_param.annotation.model_validate(args)
+    raw_result = policy.when(typed_args)
+  elif not params:
+    raw_result = policy.when()
+  else:
+    raw_result = policy.when(args)
+
+  result = await raw_result if inspect.isawaitable(raw_result) else raw_result
+  return bool(result)
 
 
 async def _execute_ask_user(policy: Policy, tool_call: types.ToolCall) -> bool:
@@ -453,8 +443,44 @@ class _PolicyDecideHook(hooks.PreToolCallDecideHook):
   on the first matching policy.
   """
 
-  def __init__(self, buckets: list[list[Policy]]):
+  def __init__(self, buckets: Sequence[Sequence[Policy]]):
     self._buckets = buckets
+
+  async def _evaluate_policy(
+      self, p: Policy, tool_call: types.ToolCall
+  ) -> hooks.HookResult | None:
+    """Evaluates a single policy against the tool call.
+
+    Args:
+      p: The policy to evaluate.
+      tool_call: The tool call data.
+
+    Returns:
+      A HookResult if the policy matches and a decision is made, or None
+      if the policy does not match. Propagates exceptions during evaluation.
+    """
+    if not _matches_tool(p, tool_call.name):
+      return None
+
+    try:
+      if not await _evaluate_predicate(p, tool_call.args):
+        return None
+
+      # First match in this bucket wins.
+      return await self._apply(p, tool_call)
+    except Exception as e:  # pylint: disable=broad-exception-caught
+      _logger.error(
+          "Exception during policy %r evaluation — failing closed.",
+          p.name or p.tool,
+          exc_info=True,
+      )
+      return hooks.HookResult(
+          allow=False,
+          message=(
+              f"Policy evaluation failed for policy '{p.name or p.tool}':"
+              f" {repr(e)}"
+          ),
+      )
 
   async def run(
       self, context: hooks.HookContext, data: types.ToolCall
@@ -469,16 +495,20 @@ class _PolicyDecideHook(hooks.PreToolCallDecideHook):
       HookResult allowing or denying the tool call.
     """
     tool_call = data
-    for bucket in self._buckets:
-      for p in bucket:
-        if not _matches_tool(p, tool_call.name):
-          continue
-
-        if not await _evaluate_predicate(p, tool_call.args):
-          continue
-
-        # First match in this bucket wins.
-        return await self._apply(p, tool_call)
+    try:
+      for bucket in self._buckets:
+        for p in bucket:
+          result = await self._evaluate_policy(p, tool_call)
+          if result is not None:
+            return result
+    except Exception as e:  # pylint: disable=broad-exception-caught
+      _logger.error(
+          "Unexpected exception in policy hook — failing closed.",
+          exc_info=True,
+      )
+      return hooks.HookResult(
+          allow=False, message=f"Internal policy error: {repr(e)}"
+      )
 
     # No policy matched — default open.
     return hooks.HookResult(allow=True)
